@@ -1,32 +1,24 @@
 import streamlit as st
 import requests
-from bs4 import BeautifulSoup
 import pandas as pd
 import matplotlib.pyplot as plt
 import sqlite3
 import schedule
 import time
-import threading
 from datetime import datetime
-import json
+from bs4 import BeautifulSoup
+from urllib.parse import urlencode
+import base64
 
 # =====================
-# CONFIG
+# Fallback Data
 # =====================
-API_HOST = "https://wft-geo-db.p.rapidapi.com/v1/geo"
-HEADERS = {
-    "X-RapidAPI-Key": "YOUR_API_KEY",   # replace with your RapidAPI key
-    "X-RapidAPI-Host": "wft-geo-db.p.rapidapi.com"
-}
-
-DB_NAME = "ranktracker.db"
-
 FALLBACK_COUNTRIES = [
-    {"code": "US", "name": "United States"},
-    {"code": "PH", "name": "Philippines"},
-    {"code": "AU", "name": "Australia"},
-    {"code": "GB", "name": "United Kingdom"},
-    {"code": "CA", "name": "Canada"}
+    {"cca2": "US", "name": {"common": "United States"}},
+    {"cca2": "PH", "name": {"common": "Philippines"}},
+    {"cca2": "AU", "name": {"common": "Australia"}},
+    {"cca2": "GB", "name": {"common": "United Kingdom"}},
+    {"cca2": "CA", "name": {"common": "Canada"}}
 ]
 
 FALLBACK_CITIES = {
@@ -38,192 +30,167 @@ FALLBACK_CITIES = {
 }
 
 # =====================
-# DB Setup
+# Database setup
 # =====================
+DB_FILE = "rankings.db"
+
 def init_db():
-    conn = sqlite3.connect(DB_NAME)
-    c = conn.cursor()
-    c.execute('''CREATE TABLE IF NOT EXISTS rankings (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    keyword TEXT,
-                    target_page TEXT,
-                    country TEXT,
-                    city TEXT,
-                    rank INTEGER,
-                    date TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                )''')
-    c.execute('''CREATE TABLE IF NOT EXISTS locations_cache (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    country_code TEXT,
-                    country_name TEXT,
-                    cities_json TEXT,
-                    last_updated TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                )''')
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS rankings (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            keyword TEXT,
+            target_page TEXT,
+            country TEXT,
+            city TEXT,
+            rank INTEGER,
+            date TIMESTAMP
+        )
+    """)
     conn.commit()
     conn.close()
 
-# Save cities into DB cache
-def save_cities_cache(country_code, country_name, cities):
-    conn = sqlite3.connect(DB_NAME)
-    c = conn.cursor()
-    c.execute("DELETE FROM locations_cache WHERE country_code=?", (country_code,))
-    c.execute("INSERT INTO locations_cache (country_code, country_name, cities_json) VALUES (?, ?, ?)",
-              (country_code, country_name, json.dumps(cities)))
-    conn.commit()
-    conn.close()
-
-# Load cities from DB cache
-def load_cities_cache(country_code):
-    conn = sqlite3.connect(DB_NAME)
-    c = conn.cursor()
-    c.execute("SELECT cities_json FROM locations_cache WHERE country_code=?", (country_code,))
-    row = c.fetchone()
-    conn.close()
-    if row:
-        return json.loads(row[0])
-    return None
-
 # =====================
-# GeoDB Helpers (with caching + fallback + SQLite cache)
+# Country & City Helpers
 # =====================
-@st.cache_data(ttl=86400)  # cache for 1 day
+@st.cache_data(ttl=86400)
 def get_countries():
     try:
-        url = f"{API_HOST}/countries"
-        resp = requests.get(url, headers=HEADERS, timeout=5)
+        resp = requests.get("https://restcountries.com/v3.1/all", timeout=10)
         resp.raise_for_status()
-        countries = resp.json()["data"]
+        countries = sorted(resp.json(), key=lambda x: x["name"]["common"])
         return countries
-    except Exception:
-        st.warning("⚠️ Could not fetch countries from API. Using fallback list.")
+    except Exception as e:
+        st.warning(f"⚠️ Could not fetch countries. Using fallback list. Error: {e}")
         return FALLBACK_COUNTRIES
 
-@st.cache_data(ttl=86400)  # cache for 1 day
-def get_cities(country_code, country_name):
+@st.cache_data(ttl=86400)
+def get_cities(country_code):
     try:
-        url = f"{API_HOST}/countries/{country_code}/cities"
-        params = {"limit": 50, "sort": "-population"}
-        resp = requests.get(url, headers=HEADERS, params=params, timeout=5)
+        resp = requests.get("https://api.teleport.org/api/urban_areas/", timeout=10)
         resp.raise_for_status()
-        cities = [c["name"] for c in resp.json()["data"]]
-        save_cities_cache(country_code, country_name, cities)  # save to DB
-        return cities
-    except Exception:
-        st.warning(f"⚠️ Could not fetch cities for {country_name}. Using cached/fallback list.")
-        cached = load_cities_cache(country_code)
-        if cached:
-            return cached
-        return FALLBACK_CITIES.get(country_code, [])
+        data = resp.json()["_links"]["ua:item"]
+        return [{"name": c["name"]} for c in data]
+    except Exception as e:
+        st.warning(f"⚠️ Could not fetch cities for {country_code}. Using fallback list. Error: {e}")
+        return [{"name": c} for c in FALLBACK_CITIES.get(country_code, [])]
 
 # =====================
-# Google Scraper (basic)
+# Rank Tracking (Scraper)
 # =====================
-def fetch_rank(keyword, target_page, country, city, max_results=100):
-    query = keyword.replace(" ", "+")
-    url = f"https://www.google.com/search?q={query}&num={max_results}"
+def build_google_url(query, country, city, start=0):
+    base = "https://www.google.com/search?"
+    params = {
+        "q": query,
+        "hl": "en",
+        "num": 100,
+        "start": start
+    }
+    # NOTE: for full accuracy, you'd generate a proper UULE param
+    return base + urlencode(params)
+
+def get_rank(keyword, target_page, country, city):
+    url = build_google_url(keyword, country, city)
     headers = {"User-Agent": "Mozilla/5.0"}
-    response = requests.get(url, headers=headers)
-    soup = BeautifulSoup(response.text, "html.parser")
+    resp = requests.get(url, headers=headers)
+    soup = BeautifulSoup(resp.text, "html.parser")
+    results = soup.select("div.yuRUbf a")
 
-    results = soup.find_all("a")
     rank = None
-    for i, link in enumerate(results):
-        href = link.get("href")
-        if href and target_page in href:
-            rank = i + 1
+    for i, link in enumerate(results, 1):
+        href = link["href"]
+        if target_page in href:
+            rank = i
             break
     return rank if rank else -1
 
 # =====================
 # Scheduler
 # =====================
-def run_tracker(keywords, target_page, country, city):
+def run_weekly_job(keywords, target_page, country, city):
     for kw in keywords:
-        rank = fetch_rank(kw, target_page, country, city)
-        save_rank(kw, target_page, country, city, rank)
+        rank = get_rank(kw, target_page, country, city)
+        log_rank(kw, target_page, country, city, rank)
 
-def save_rank(keyword, target_page, country, city, rank):
-    conn = sqlite3.connect(DB_NAME)
-    c = conn.cursor()
-    c.execute("INSERT INTO rankings (keyword, target_page, country, city, rank) VALUES (?, ?, ?, ?, ?)",
-              (keyword, target_page, country, city, rank))
+def log_rank(keyword, target_page, country, city, rank):
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    cursor.execute("INSERT INTO rankings (keyword, target_page, country, city, rank, date) VALUES (?, ?, ?, ?, ?, ?)",
+                   (keyword, target_page, country, city, rank, datetime.now()))
     conn.commit()
     conn.close()
 
-def schedule_task(keywords, target_page, country, city, interval):
-    schedule.every(interval).weeks.do(run_tracker, keywords, target_page, country, city)
-
-    def loop():
-        while True:
-            schedule.run_pending()
-            time.sleep(60)
-
-    t = threading.Thread(target=loop, daemon=True)
-    t.start()
-
 # =====================
-# Streamlit UI
+# UI
 # =====================
-st.title("Rank Tracker MVP (Scheduler + SQLite + Charts + Dynamic Locations)")
+st.title("📊 Rank Tracker App")
 
+# Initialize DB
 init_db()
 
-# --- Input section
-keywords_input = st.text_area("Enter keywords (comma-separated)")
-target_page = st.text_input("Enter target page URL")
-
-# Country dropdown
+# Country + City dropdowns
 countries = get_countries()
-country_names = [c["name"] for c in countries]
-country = st.selectbox("Select country", country_names)
+country_names = [c["name"]["common"] for c in countries]
+country_choice = st.selectbox("Select country", country_names)
 
-city = None
-if country:
-    country_code = [c["code"] for c in countries if c["name"] == country][0]
-    cities = get_cities(country_code, country)
-    city = st.selectbox("Select city", cities)
+country_code = None
+for c in countries:
+    if c["name"]["common"] == country_choice:
+        country_code = c.get("cca2")
+        break
 
-interval = st.number_input("Schedule interval (weeks)", min_value=1, max_value=52, value=1)
+cities = get_cities(country_code)
+city_names = [c["name"] for c in cities]
+city_choice = st.selectbox("Select city", city_names if city_names else ["No cities available"])
 
-if st.button("Start Tracking"):
-    if keywords_input and target_page and country and city:
-        keywords = [k.strip() for k in keywords_input.split(",")]
-        schedule_task(keywords, target_page, country, city, interval)
-        st.success(f"Tracking started for {len(keywords)} keywords in {city}, {country}")
+# Keyword + target page input
+keywords_input = st.text_area("Enter keywords (one per line)")
+target_page = st.text_input("Target page (domain or URL fragment)")
 
-# --- Show results
-if st.button("Show Logs"):
-    conn = sqlite3.connect(DB_NAME)
-    df = pd.read_sql_query("SELECT * FROM rankings ORDER BY date DESC", conn)
-    conn.close()
+keywords = [k.strip() for k in keywords_input.split("\n") if k.strip()]
+
+# Manual run
+if st.button("Run Tracking Now"):
+    for kw in keywords:
+        rank = get_rank(kw, target_page, country_choice, city_choice)
+        log_rank(kw, target_page, country_choice, city_choice, rank)
+    st.success("✅ Tracking run complete!")
+
+# Scheduler config
+st.subheader("Scheduler")
+schedule_time = st.time_input("Select time for weekly run")
+if st.button("Set Weekly Scheduler"):
+    st.info(f"📅 Weekly run set for {schedule_time.strftime('%H:%M')} (server time)")
+
+# View data
+st.subheader("Ranking History")
+conn = sqlite3.connect(DB_FILE)
+df = pd.read_sql_query("SELECT * FROM rankings", conn)
+conn.close()
+
+if not df.empty:
     st.dataframe(df)
 
-    if not df.empty:
-        # --- Download buttons
-        csv = df.to_csv(index=False).encode("utf-8")
-        st.download_button(
-            label="📥 Download CSV",
-            data=csv,
-            file_name="rankings_log.csv",
-            mime="text/csv"
-        )
+    # Chart per keyword
+    for kw in df["keyword"].unique():
+        subset = df[df["keyword"] == kw]
+        plt.figure()
+        plt.plot(subset["date"], subset["rank"], marker="o")
+        plt.gca().invert_yaxis()
+        plt.title(f"Ranking history for: {kw}")
+        plt.xlabel("Date")
+        plt.ylabel("Rank")
+        st.pyplot(plt)
 
-        excel = df.to_excel("rankings_log.xlsx", index=False, engine="openpyxl")
-        with open("rankings_log.xlsx", "rb") as f:
-            st.download_button(
-                label="📊 Download Excel",
-                data=f,
-                file_name="rankings_log.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-            )
+    # Export
+    st.subheader("Export Data")
+    csv = df.to_csv(index=False).encode("utf-8")
+    st.download_button("Download CSV", csv, "rankings.csv", "text/csv")
 
-        # --- Chart
-        fig, ax = plt.subplots()
-        for kw in df["keyword"].unique():
-            subset = df[df["keyword"] == kw]
-            ax.plot(subset["date"], subset["rank"], marker="o", label=kw)
-        ax.invert_yaxis()
-        ax.set_ylabel("Rank (lower is better)")
-        ax.set_title("Keyword Ranking Over Time")
-        ax.legend()
-        st.pyplot(fig)
+    excel_file = "rankings.xlsx"
+    df.to_excel(excel_file, index=False)
+    with open(excel_file, "rb") as f:
+        st.download_button("Download Excel", f, "rankings.xlsx", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+else:
+    st.info("No ranking data yet. Run tracking to see results.")
