@@ -1,0 +1,24 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.db
+
+# Environments
+.env
+.venv
+venv/
+ENV/
+env/
+
+# Streamlit
+.streamlit/secrets.toml
+.streamlit/*.lock
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Data
+/data/
