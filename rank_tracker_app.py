@@ -9,7 +9,8 @@ import threading
 import time
 import datetime
 
-DB_FILE = "rankings.db"
+# Use Streamlit's cache directory
+DB_FILE = os.path.join(st.secrets.get("DB_PATH", "."), "rankings.db")
 
 # =============================
 # DATABASE SETUP
@@ -28,6 +29,16 @@ def init_db():
             date TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     """)
+    conn.commit()
+    conn.close()
+    
+def save_result(keyword, country, city, target_url, rank):
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute(
+        "INSERT INTO rankings (keyword, country, city, target_url, rank) VALUES (?, ?, ?, ?, ?)",
+        (keyword, country, city, target_url, rank),
+    )
     conn.commit()
     conn.close()
 
