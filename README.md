@@ -1,19 +1,16 @@
 # Rank Tracker App
 
-A simple keyword rank tracking tool built with Streamlit.  
-Tracks keywords across multiple cities and countries, stores logs in SQLite, and visualizes results.
+A Streamlit app to track keyword rankings in Google at both national and city levels.  
 
 ### Features
-- National + city-level keyword tracking (UULE parameter)
-- Auto-scheduler (weekly runs)
+- Country + city dropdowns (RESTCountries + Teleport APIs, with fallbacks)
+- Scraper-based Google rank tracking (top 100 results)
 - SQLite logging
-- Charts for ranking history
-- Export results to CSV/Excel
-- Dynamic country/city selection (via GeoDB API with fallback)
+- Weekly scheduler
+- Ranking history charts
+- Export to CSV & Excel
 
-### Setup
+### Run locally
 ```bash
-git clone https://github.com/zorenpescador/rank_tracker_app.git
-cd rank_tracker_app
 pip install -r requirements.txt
 streamlit run rank_tracker_app.py
